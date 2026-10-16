@@ -1,0 +1,25 @@
+# ConfigMap used as nginx configuration. The React app is a single page
+# application, so unknown paths fall back to index.html.
+# Look: microk8s kubectl describe configmap -n sara web-nginx
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-nginx
+  namespace: sara
+data:
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;
+      root /usr/share/nginx/html;
+      index index.html;
+
+      location /photos/ {
+        try_files $uri =404;
+        add_header cache-control "public, max-age=3600";
+      }
+
+      location / {
+        try_files $uri $uri/ /index.html;
+      }
+    }

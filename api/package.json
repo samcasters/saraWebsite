@@ -1,0 +1,12 @@
+{
+  "name": "sara-api",
+  "private": true,
+  "description": "Small API between the Sara's house site and Neo4j.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "neo4j-driver": "^5.28.1"
+  }
+}

@@ -1,0 +1,6 @@
+# Namespace. Idea: your app lives in `sara`, away from the control-plane add-ons in `kube-system`.
+# Look: microk8s kubectl get ns
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sara

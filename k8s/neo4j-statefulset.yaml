@@ -1,0 +1,87 @@
+# StatefulSet + Volume. Idea: Neo4j keeps the name neo4j-0 and the same disk
+# across restarts. The claim is filled by the hostpath-storage add-on,
+# whose files we place on the USB.
+# Look: microk8s kubectl get statefulset,pvc,pod -n sara
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: sara
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      securityContext:
+        fsGroup: 7474
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: neo4j
+          image: neo4j:5.26.32-community
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 7474
+            - name: bolt
+              containerPort: 7687
+          env:
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: sara-secret
+                  key: NEO4J_AUTH
+            - name: NEO4J_server_memory_heap_initial__size
+              value: 512m
+            - name: NEO4J_server_memory_heap_max__size
+              value: 512m
+            - name: NEO4J_server_memory_pagecache_size
+              value: 256m
+            - name: NEO4J_db_temporal_timezone
+              valueFrom:
+                configMapKeyRef:
+                  name: sara-config
+                  key: TZ
+            - name: NEO4J_server_jvm_additional
+              value: "-XX:+ExitOnOutOfMemoryError"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 768Mi
+            limits:
+              cpu: "1500m"
+              memory: 1536Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 20
+            failureThreshold: 6
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: microk8s-hostpath
+        resources:
+          requests:
+            storage: 8Gi

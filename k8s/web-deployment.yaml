@@ -1,0 +1,57 @@
+# Deployment + Volume. Idea: nginx is replaceable. The built site and the
+# photos live on the Pi and are mounted in. Replacing the Pod does not
+# remove the pictures.
+# Look: microk8s kubectl get deploy,pod -n sara -l app=web
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: sara
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              cpu: 20m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+            - name: photos
+              mountPath: /usr/share/nginx/html/photos
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+      volumes:
+        - name: html
+          hostPath:
+            path: /home/EVE/saraWebsite/web/dist
+            type: Directory
+        - name: photos
+          hostPath:
+            path: /home/EVE/saraWebsite/content/photos
+            type: Directory
+        - name: nginx-conf
+          configMap:
+            name: web-nginx

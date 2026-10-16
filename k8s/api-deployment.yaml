@@ -1,0 +1,73 @@
+# Deployment. Idea: the API keeps no data of its own. Kubernetes may replace
+# the Pod. The new Pod name gets a random suffix. The Service name stays.
+# The container image is stock Node. This folder is mounted in as a Volume,
+# which saves running a second image builder on the Pi.
+# Look: microk8s kubectl get deploy,pod -n sara -l app=api
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: sara
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["node", "server.js"]
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NEO4J_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: sara-config
+                  key: NEO4J_URI
+            - name: NEO4J_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: sara-config
+                  key: NEO4J_USER
+            - name: TZ
+              valueFrom:
+                configMapKeyRef:
+                  name: sara-config
+                  key: TZ
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sara-secret
+                  key: NEO4J_PASSWORD
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: api
+              mountPath: /app
+      volumes:
+        - name: api
+          hostPath:
+            path: /home/EVE/saraWebsite/api
+            type: Directory

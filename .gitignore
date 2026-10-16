@@ -1,0 +1,8 @@
+node_modules/
+dist/
+web/dist/
+k8s/secret.yaml
+.env
+.env.*
+*.local
+.DS_Store

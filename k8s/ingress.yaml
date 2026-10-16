@@ -1,0 +1,28 @@
+# Ingress. Idea: the door from the house LAN (and later the internet) into
+# the cluster. / goes to the website Service. /api goes to the API Service.
+# The class name is checked after the ingress add-on is enabled.
+# Look: microk8s kubectl get ingress -n sara
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sara
+  namespace: sara
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80

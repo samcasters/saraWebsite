@@ -1,0 +1,14 @@
+# Service in front of the website Pods.
+# Look: microk8s kubectl get svc -n sara web
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: sara
+spec:
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

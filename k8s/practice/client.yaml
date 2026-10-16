@@ -1,0 +1,19 @@
+# Practice client. From inside this Pod we call the other Pod by its
+# cluster IP, then by the Service DNS name.
+# Look: microk8s kubectl exec -n sara practice-client -- wget -qO- http://practice-web.sara.svc.cluster.local/
+apiVersion: v1
+kind: Pod
+metadata:
+  name: practice-client
+  namespace: sara
+spec:
+  containers:
+    - name: client
+      image: busybox:1.36
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      resources:
+        requests:
+          memory: 8Mi
+        limits:
+          memory: 32Mi
