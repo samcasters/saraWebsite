@@ -244,8 +244,8 @@ Private repo `git@github.com:samcasters/saraWebsite.git`. Push comes after the s
 
 ### GitHub and wrap-up
 
-- [ ] Private repo `samcasters/saraWebsite` exists
-- [ ] Branch pushed
+- [x] Private repo `samcasters/saraWebsite` exists
+- [x] Branch pushed
 - [x] Password is not in the repo
 - [x] Guest names from real bookings are not committed
 - [x] Version, LAN URL, public URL, and data path recorded in the log
@@ -279,3 +279,4 @@ A second node, a domain name, HTTPS, accounts, email, and payments.
 - 2026-10-19: Ingress `sara` routes `/api` to the API and `/` to the website. From this Pi, `http://10.0.0.32/` returned the house page, `/api/house` returned JSON, and `/photos/front.jpg` returned the picture. A second booking on 2026-10-22 returned 409, then that test booking was deleted. A phone on the LAN has not been tried yet.
 - 2026-10-19: Public address is `91.183.41.76`. The public URL will be `http://91.183.41.76/` after the router forwards TCP 80 to `10.0.0.32:80`. Do not forward 7474 or 7687. HTTPS stays off until there is a domain name. Neo4j data path is the PVC folder above. MicroK8s version v1.36.2. LAN URL `http://10.0.0.32/`.
 - 2026-10-19: Practice Pods and Service removed. Namespace `sara` now has `neo4j-0`, the API Deployment, and the web Deployment.
+- 2026-10-19: Private repo https://github.com/samcasters/saraWebsite has `main` at `11d3173`. Password and test guest names are not in the repo.
