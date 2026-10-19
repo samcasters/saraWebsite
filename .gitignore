@@ -4,5 +4,6 @@ web/dist/
 k8s/secret.yaml
 .env
 .env.*
+!.env.example
 *.local
 .DS_Store

@@ -10,6 +10,6 @@ fi
 
 "$K8S" kubectl wait -n sara --for=condition=Ready pod/neo4j-0 --timeout=300s
 "$K8S" kubectl exec -i -n sara neo4j-0 -- \
-  bash -lc 'cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" --fail-fast' \
+  bash -lc '/var/lib/neo4j/bin/cypher-shell -u neo4j -p "${NEO4J_AUTH#neo4j/}" --fail-fast' \
   < "$ROOT/db/seed.cypher"
 echo "Seed loaded."

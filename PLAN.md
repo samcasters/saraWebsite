@@ -4,15 +4,11 @@ Learning build on this Raspberry Pi. One node runs the control plane and the sit
 
 ## Where we are
 
-Next: reformat the USB, then install MicroK8s. Both need your sudo password. This session cannot type it for you.
+The USB is mounted at `/mnt/sara-usb` (ext4, label `sara-data`) with a 1 GB swap file. MicroK8s v1.36.2 is running. Node `walle` is Ready at `10.0.0.32`. Cluster data is bind-mounted from `/mnt/sara-usb/microk8s-common`. User `EVE` is in group `microk8s`. Add-ons dns, hostpath-storage, and ingress are enabled. The control plane is the snap services `kubelite` and `k8s-dqlite`.
 
-The project files are in `/home/EVE/saraWebsite`. The cluster is not installed yet.
+Namespace `sara` is up. Neo4j is the StatefulSet pod `neo4j-0`, with its disk on the USB. The API and the website are Deployments. Ingress serves the site at `http://10.0.0.32/`. Compose is stopped, so only one Neo4j is running. Its old files are still at `/mnt/sara-usb/compose/neo4j`.
 
-USB found on 16 Oct 2026, not formatted yet:
-
-- Disk `/dev/sda`, removable, model "Flash Disk", about 29 GB (a 32 GB stick).
-- Old filesystem: exFAT, label `USB_RAPTOR`, not mounted.
-- The SD card is `/dev/mmcblk0`. The format script refuses to touch it.
+Next: forward router TCP port 80 to `10.0.0.32:80`, then create the private GitHub repo and push `main`. HTTPS waits until there is a domain name.
 
 ## This machine
 
@@ -205,55 +201,55 @@ Private repo `git@github.com:samcasters/saraWebsite.git`. Push comes after the s
 - [x] `PLAN.md` in the folder, this guide plus this checklist
 - [x] `.gitignore` ignores secrets, `node_modules`, and build output
 - [x] First local git commit
-- [ ] USB formatted ext4, label `sara-data`, mounted at `/mnt/sara-usb`
-- [ ] 1 GB swap on the USB is active
-- [ ] Disk free space checked before image pulls
+- [x] USB formatted ext4, label `sara-data`, mounted at `/mnt/sara-usb`
+- [x] 1 GB swap on the USB is active
+- [x] Disk free space checked before image pulls (26 GB free on the USB, 17 GB free on the SD card)
 
 ### Cluster
 
-- [ ] MicroK8s installed and the version written in the log
-- [ ] MicroK8s data bind-mounted from the USB
-- [ ] User `EVE` is in group `microk8s`
-- [ ] Node is `Ready`
-- [ ] Control plane services seen and explained
-- [ ] Practice Pod ran and its IP was different from `10.0.0.32`
-- [ ] A second Pod reached the first over the virtual network
-- [ ] ClusterIP Service resolved by DNS inside the cluster
-- [ ] Add-ons enabled: dns, hostpath-storage, ingress
-- [ ] No extra add-ons enabled
+- [x] MicroK8s installed and the version written in the log
+- [x] MicroK8s data bind-mounted from the USB
+- [x] User `EVE` is in group `microk8s`
+- [x] Node is `Ready`
+- [x] Control plane services seen and explained
+- [x] Practice Pod ran and its IP was different from `10.0.0.32`
+- [x] A second Pod reached the first over the virtual network
+- [x] ClusterIP Service resolved by DNS inside the cluster
+- [x] Add-ons enabled: dns, hostpath-storage, ingress
+- [x] No extra add-ons enabled
 
 ### Data and apps
 
-- [ ] ConfigMap applied and described
-- [ ] Secret created on the Pi and absent from git
-- [ ] Neo4j StatefulSet `neo4j-0` is Ready
-- [ ] PVC is Bound and the folder on the USB was found
-- [ ] Seed loaded: house, photos, activities, days, a few bookings
-- [ ] API Deployment recreated a Pod after we deleted one
-- [ ] API health, house, activities, availability, and booking checked
-- [ ] A second booking on the same day is refused
-- [ ] Web Deployment serves the three pages
-- [ ] Photo folder is mounted into the web Pod
-- [ ] Ingress routes `/` and `/api`
-- [ ] Site opened from the LAN at `http://10.0.0.32/`
-- [ ] English copy is read from `web/src/i18n/en.js`
+- [x] ConfigMap applied and described
+- [x] Secret created on the Pi and absent from git
+- [x] Neo4j StatefulSet `neo4j-0` is Ready
+- [x] PVC is Bound and the folder on the USB was found
+- [x] Seed loaded: house, photos, activities, days, a few bookings
+- [x] API Deployment recreated a Pod after we deleted one
+- [x] API health, house, activities, availability, and booking checked
+- [x] A second booking on the same day is refused
+- [x] Web Deployment serves the three pages
+- [x] Photo folder is mounted into the web Pod
+- [x] Ingress routes `/` and `/api`
+- [x] Site opened from the LAN at `http://10.0.0.32/`
+- [x] English copy is read from `web/src/i18n/en.js`
 
 ### Internet
 
-- [ ] Public IP written in the log
+- [x] Public IP written in the log
 - [ ] Router forwards TCP 80 to `10.0.0.32:80`
 - [ ] Neo4j ports are not forwarded
 - [ ] House page and a booking work from a phone on mobile data
-- [ ] HTTPS left for later, until there is a domain name
+- [x] HTTPS left for later, until there is a domain name
 
 ### GitHub and wrap-up
 
 - [ ] Private repo `samcasters/saraWebsite` exists
 - [ ] Branch pushed
-- [ ] Password is not in the repo
-- [ ] Guest names from real bookings are not committed
-- [ ] Version, LAN URL, public URL, and data path recorded in the log
-- [ ] Practice Pods removed
+- [x] Password is not in the repo
+- [x] Guest names from real bookings are not committed
+- [x] Version, LAN URL, public URL, and data path recorded in the log
+- [x] Practice Pods removed
 
 ## Decisions
 
@@ -272,3 +268,14 @@ A second node, a domain name, HTTPS, accounts, email, and payments.
 ## Log
 
 - 2026-10-16: Project files written. USB is plugged in as `/dev/sda` (old label `USB_RAPTOR`) and is waiting to be erased. MicroK8s version: not installed yet. LAN URL: `http://10.0.0.32/` once Ingress exists. Public URL: not set. Neo4j data path: not created yet.
+- 2026-10-16: USB formatted. `/dev/sda1` is ext4 label `sara-data`, mounted at `/mnt/sara-usb`, 26 GB free. Swap file `/mnt/sara-usb/swapfile` is 1 GB and active. Control helper added at `~/k8s`. MicroK8s is not installed yet.
+- 2026-10-16: Compose file added at `saraWebsite/compose.yaml` with services web, api, and neo4j. Install script is `~/k8s/install-node.sh` (Docker data-root and MicroK8s data on the USB, MicroK8s channel 1.36/stable).
+- 2026-10-16: MicroK8s v1.36.2 is installed. Node `walle` is Ready, internal IP `10.0.0.32`, containerd 2.2.3. `/var/snap/microk8s/common` is a bind mount of `/mnt/sara-usb/microk8s-common`. User `EVE` is in group `microk8s`. Snap services `kubelite` (API server, scheduler, controller manager) and `k8s-dqlite` (cluster database) are active. Enabled add-ons: dns, hostpath-storage, ingress. StorageClass `microk8s-hostpath`. Ingress class `nginx` is Traefik. Helm, Helm 3, the storage alias, and the single-node datastore are built-in core entries. Dashboard, Prometheus, MetalLB, metrics-server, and cert-manager are disabled. The SD copy `/var/snap/microk8s/common.sd-backup` is still present.
+- 2026-10-19: Practice Pod `practice-web` had IP `10.1.176.209`. The client Pod had IP `10.1.176.210`. Both are on the Calico network, not `10.0.0.32`. The client fetched the nginx welcome page from the Pod IP and from `http://practice-web.sara.svc.cluster.local/` (ClusterIP `10.152.183.246`).
+- 2026-10-19: ConfigMap `sara-config` applied. Secret `sara-secret` created in the cluster. The password is not in git.
+- 2026-10-19: Compose was stopped so Neo4j would not run twice. StatefulSet pod `neo4j-0` is Ready. PVC `data-neo4j-0` is Bound, 8Gi, folder `/mnt/sara-usb/microk8s-common/default-storage/sara-data-neo4j-0-pvc-fe929665-51f9-47cb-8c2d-d7586a97cb04`. Seed loaded. House "Sara's house" links to Canal towpath, The corner bakery, Village market, and Woodland loop.
+- 2026-10-19: API Deployment replaced pod `api-5897bcbc55-99f9n` with `api-5897bcbc55-m9lhl`. From inside the cluster: health, house, activities, and October availability answered. A booking returned 201, and the same day returned 409. The test booking was deleted. Sample guest bookings remain on 2026-10-23, 2026-10-30, and 2026-11-06.
+- 2026-10-19: Web Deployment serves `/`, `/activities`, and `/booking`. `/photos` in the Pod lists the four sample photos. `/photos/front.jpg` is 439622 bytes. Pages read strings through `web/src/i18n/index.js`, which loads `en.js`.
+- 2026-10-19: Ingress `sara` routes `/api` to the API and `/` to the website. From this Pi, `http://10.0.0.32/` returned the house page, `/api/house` returned JSON, and `/photos/front.jpg` returned the picture. A second booking on 2026-10-22 returned 409, then that test booking was deleted. A phone on the LAN has not been tried yet.
+- 2026-10-19: Public address is `91.183.41.76`. The public URL will be `http://91.183.41.76/` after the router forwards TCP 80 to `10.0.0.32:80`. Do not forward 7474 or 7687. HTTPS stays off until there is a domain name. Neo4j data path is the PVC folder above. MicroK8s version v1.36.2. LAN URL `http://10.0.0.32/`.
+- 2026-10-19: Practice Pods and Service removed. Namespace `sara` now has `neo4j-0`, the API Deployment, and the web Deployment.
