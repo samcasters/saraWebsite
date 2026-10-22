@@ -1,4 +1,4 @@
-import en from './en.js';
+import nl from './nl.js';
 
-// One language for now. A Dutch dictionary can replace or sit beside this.
-export const t = en;
+// Dutch is the language of the design pictures. en.js remains for later.
+export const t = nl;

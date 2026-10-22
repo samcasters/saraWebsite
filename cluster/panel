@@ -1,0 +1,1387 @@
+#!/usr/bin/env python3
+"""Numbered control panel for the MicroK8s cluster on this Pi.
+
+Run it from your own SSH session:
+
+    ~/k8s/panel
+"""
+
+import curses
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+LOCKED_NAMESPACES = {"kube-system", "ingress"}
+SYSTEM_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "ingress"}
+MAX_DEPLOYMENT_REPLICAS = 3
+REFRESH_MS = 2000
+
+
+def microk8s_bin():
+    found = shutil.which("microk8s")
+    if found:
+        return found
+    if os.path.exists("/snap/bin/microk8s"):
+        return "/snap/bin/microk8s"
+    return None
+
+
+class Cluster:
+    def __init__(self):
+        self.binary = microk8s_bin()
+        self.use_sg = False
+        if not self.binary:
+            return
+        probe = subprocess.run(
+            [self.binary, "kubectl", "get", "ns"],
+            capture_output=True,
+            text=True,
+        )
+        err = (probe.stderr or "") + (probe.stdout or "")
+        self.use_sg = "Insufficient permissions" in err
+
+    def available(self):
+        return self.binary is not None
+
+    def run(self, args, timeout=40, check=True):
+        if not self.binary:
+            raise RuntimeError("MicroK8s is not installed.")
+        if self.use_sg:
+            command = shlex.join([self.binary, *args])
+            result = subprocess.run(
+                ["sg", "microk8s", "-c", command],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        else:
+            result = subprocess.run(
+                [self.binary, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        if check and result.returncode != 0:
+            detail = (result.stderr or result.stdout or "command failed").strip()
+            raise RuntimeError(detail)
+        return result
+
+    def json(self, args, timeout=40):
+        result = self.run([*args, "-o", "json"], timeout=timeout)
+        return json.loads(result.stdout or "{}")
+
+    def visible(self, args, timeout=180):
+        if not self.binary:
+            raise RuntimeError("MicroK8s is not installed.")
+        if self.use_sg:
+            command = shlex.join([self.binary, *args])
+            result = subprocess.run(["sg", "microk8s", "-c", command], timeout=timeout)
+        else:
+            result = subprocess.run([self.binary, *args], timeout=timeout)
+        if result.returncode != 0:
+            raise RuntimeError(f"The command exited {result.returncode}.")
+        return 0
+
+
+def compose_neo4j_running():
+    args = ["ps", "-q", "--filter", "name=sara-neo4j", "--filter", "status=running"]
+    direct = subprocess.run(["docker", *args], capture_output=True, text=True)
+    text = direct.stdout if direct.returncode == 0 else ""
+    if direct.returncode != 0:
+        command = "docker " + shlex.join(args)
+        via_sg = subprocess.run(["sg", "docker", "-c", command], capture_output=True, text=True)
+        text = via_sg.stdout if via_sg.returncode == 0 else ""
+    return bool(text.strip())
+
+
+def selector_matches(selector, labels):
+    if not selector:
+        return False
+    labels = labels or {}
+    return all(labels.get(key) == value for key, value in selector.items())
+
+
+def service_text(services, namespace, labels):
+    matched = []
+    for service in services:
+        meta = service["metadata"]
+        if meta["namespace"] != namespace:
+            continue
+        if not selector_matches(service["spec"].get("selector"), labels):
+            continue
+        ports = []
+        for port in service["spec"].get("ports") or []:
+            number = port.get("port")
+            if number is None:
+                continue
+            ports.append((number, port.get("protocol") or "TCP"))
+        numbers = [number for number, _ in ports]
+        shown = []
+        for number, protocol in ports:
+            if numbers.count(number) > 1:
+                shown.append(f"{number}/{protocol}")
+            else:
+                shown.append(str(number))
+        port_text = ",".join(shown) if shown else "?"
+        matched.append(f"{meta['name']}:{port_text}")
+    return ", ".join(matched) if matched else "-"
+
+
+def ingress_text(ingresses, namespace, service_names):
+    if not service_names:
+        return "-"
+    hits = []
+    for ingress in ingresses:
+        meta = ingress["metadata"]
+        if meta["namespace"] != namespace:
+            continue
+        for rule in (ingress["spec"] or {}).get("rules") or []:
+            http = rule.get("http") or {}
+            for path in http.get("paths") or []:
+                backend = ((path.get("backend") or {}).get("service") or {})
+                name = backend.get("name")
+                if name not in service_names:
+                    continue
+                shown = path.get("path") or "/"
+                port = ((backend.get("port") or {}).get("number"))
+                port_text = f":{port}" if port else ""
+                hits.append(f"{shown} -> {name}{port_text}")
+    return ", ".join(hits) if hits else "-"
+
+
+def service_names_for(services, namespace, labels):
+    names = []
+    for service in services:
+        meta = service["metadata"]
+        if meta["namespace"] != namespace:
+            continue
+        if selector_matches(service["spec"].get("selector"), labels):
+            names.append(meta["name"])
+    return names
+
+
+def pod_ready(pod):
+    statuses = pod["status"].get("containerStatuses") or []
+    total = len(statuses) or len(pod["spec"].get("containers") or [])
+    ready = sum(1 for status in statuses if status.get("ready"))
+    return f"{ready}/{total}"
+
+
+def pod_status(pod):
+    for status in pod["status"].get("containerStatuses") or []:
+        state = status.get("state") or {}
+        if "waiting" in state:
+            return state["waiting"].get("reason") or "Waiting"
+        if "terminated" in state and pod["status"].get("phase") != "Succeeded":
+            return state["terminated"].get("reason") or "Terminated"
+    return pod["status"].get("phase") or "Unknown"
+
+
+def node_ready(node):
+    for condition in node["status"].get("conditions") or []:
+        if condition.get("type") == "Ready":
+            return "Ready" if condition.get("status") == "True" else "NotReady"
+    return "Unknown"
+
+
+def node_ip(node):
+    for address in node["status"].get("addresses") or []:
+        if address.get("type") == "InternalIP":
+            return address.get("address") or "-"
+    return "-"
+
+
+def pad(text, width):
+    """Pad short columns so they line up. Keep long text so left and right can scroll to it."""
+    text = str(text)
+    if len(text) >= width:
+        return text + "  "
+    return text.ljust(width)
+
+
+def status_kind(text):
+    if text in ("Running", "Ready", "Succeeded"):
+        return "ok"
+    if text in ("Pending", "ContainerCreating", "PodInitializing", "Terminating"):
+        return "warn"
+    bad_words = ("Error", "Fail", "BackOff", "NotReady", "Unknown", "OOM", "Crash", "Err", "Pull", "Invalid", "Evicted")
+    if any(word in text for word in bad_words):
+        return "bad"
+    return ""
+
+
+def pod_matches(pod, hide_system, needle):
+    meta = pod["metadata"]
+    if hide_system and meta["namespace"] in SYSTEM_NAMESPACES:
+        return False
+    if needle:
+        blob = f"{meta['namespace']}/{meta['name']} {pod_status(pod)}".lower()
+        if needle not in blob:
+            return False
+    return True
+
+
+def pod_pieces(pod, services, ingresses):
+    meta = pod["metadata"]
+    labels = meta.get("labels") or {}
+    namespace = meta["namespace"]
+    names = service_names_for(services, namespace, labels)
+    status = pod_status(pod)
+    ready = pod_ready(pod)
+    ready_kind = "ok" if ready.split("/")[0] == ready.split("/")[-1] and ready != "0/0" else "warn"
+    return [
+        (pad(f"{namespace}/{meta['name']}", 50), ""),
+        (pad(ready, 7), ready_kind),
+        (pad(status, 18), status_kind(status)),
+        (pad(service_text(services, namespace, labels), 28), ""),
+        (ingress_text(ingresses, namespace, names), ""),
+    ]
+
+
+def build_map(nodes, pods, services, ingresses, hide_system=False, query=""):
+    by_node = {node["metadata"]["name"]: [] for node in nodes}
+    waiting = []
+    for pod in pods:
+        name = pod["spec"].get("nodeName")
+        if name and name in by_node:
+            by_node[name].append(pod)
+        else:
+            waiting.append(pod)
+
+    needle = query.strip().lower()
+    lines = [[
+        (pad("POD", 50), "bold"),
+        (pad("READY", 7), "bold"),
+        (pad("STATUS", 18), "bold"),
+        (pad("SERVICE", 28), "bold"),
+        ("INGRESS", "bold"),
+    ]]
+    if hide_system:
+        lines.append([("Cluster pods are hidden. Press h to show them.", "dim")])
+    if needle:
+        lines.append([(f"Find: {query.strip()}", "dim")])
+
+    shown = 0
+    hidden = 0
+
+    def take(group):
+        nonlocal hidden
+        kept = []
+        for pod in group:
+            if pod_matches(pod, hide_system, needle):
+                kept.append(pod)
+            else:
+                hidden += 1
+        return kept
+
+    ordered = sorted(nodes, key=lambda item: item["metadata"]["name"])
+    if not ordered and not waiting:
+        lines.append("No nodes yet.")
+        return lines
+
+    for node in ordered:
+        meta = node["metadata"]
+        runtime = ((node["status"].get("nodeInfo") or {}).get("containerRuntimeVersion") or "-")
+        group = sorted(by_node.get(meta["name"], []), key=lambda item: (
+            item["metadata"]["namespace"], item["metadata"]["name"]
+        ))
+        matching = take(group)
+        if not matching and (needle or hide_system):
+            continue
+        ready = node_ready(node)
+        lines.append([("", "")])
+        lines.append([
+            (f"NODE {meta['name']}    ", "title"),
+            (ready, "ok" if ready == "Ready" else "bad"),
+            (f"    {node_ip(node)}    {runtime}", "dim"),
+        ])
+        if not matching:
+            lines.append([("  no pods on this node", "dim")])
+        for pod in matching:
+            lines.append(pod_pieces(pod, services, ingresses))
+            shown += 1
+
+    matching_wait = take(sorted(waiting, key=lambda item: (
+        item["metadata"]["namespace"], item["metadata"]["name"]
+    )))
+    if matching_wait:
+        lines.append([("", "")])
+        lines.append([("NODE (not scheduled)", "warn")])
+        for pod in matching_wait:
+            lines.append(pod_pieces(pod, services, ingresses))
+            shown += 1
+
+    lines.append([("", "")])
+    lines.append([(f"{shown} pods shown, {hidden} hidden", "dim")])
+    return lines
+
+
+def scale_decision(kind, namespace, name, desired, compose_running):
+    if namespace in LOCKED_NAMESPACES:
+        return "locked", f"{namespace}/{name} belongs to the cluster itself and is not scaled here."
+    if not isinstance(desired, int) or desired < 0:
+        return "reject", "Type a whole number, 0 or more."
+    if compose_running and "neo4j" in name and desired > 0:
+        return "reject", "Compose is already running Neo4j. Stop it before starting that database in Kubernetes."
+    if kind == "Deployment" and desired > MAX_DEPLOYMENT_REPLICAS:
+        return "reject", f"This Pi keeps a Deployment at {MAX_DEPLOYMENT_REPLICAS} pods or fewer."
+    if kind == "StatefulSet" and desired != 1:
+        return "confirm", (
+            "A StatefulSet gives each pod its own disk. "
+            "More than one Neo4j pod is not a copy of the same database. Type YES to continue."
+        )
+    return "ok", ""
+
+
+def workload_rows(deployments, statefulsets):
+    rows = []
+    for item in deployments.get("items") or []:
+        meta = item["metadata"]
+        rows.append({
+            "kind": "Deployment",
+            "name": meta["name"],
+            "namespace": meta["namespace"],
+            "replicas": item["spec"].get("replicas", 0),
+            "ready": (item.get("status") or {}).get("readyReplicas", 0) or 0,
+        })
+    for item in statefulsets.get("items") or []:
+        meta = item["metadata"]
+        rows.append({
+            "kind": "StatefulSet",
+            "name": meta["name"],
+            "namespace": meta["namespace"],
+            "replicas": item["spec"].get("replicas", 0),
+            "ready": (item.get("status") or {}).get("readyReplicas", 0) or 0,
+        })
+    rows.sort(key=lambda row: (row["namespace"] in LOCKED_NAMESPACES, row["namespace"], row["name"]))
+    return rows
+
+
+def pod_reason(pod):
+    lines = [
+        f"{pod['metadata']['namespace']}/{pod['metadata']['name']}",
+        f"Node: {pod['spec'].get('nodeName') or 'not scheduled'}",
+        f"Phase: {pod['status'].get('phase') or '-'}",
+        f"Status: {pod_status(pod)}",
+    ]
+    for condition in pod["status"].get("conditions") or []:
+        if condition.get("status") == "False" or condition.get("reason"):
+            message = condition.get("message") or ""
+            lines.append(
+                f"{condition.get('type')}: {condition.get('status')} {condition.get('reason') or ''} {message}".rstrip()
+            )
+    for status in pod["status"].get("containerStatuses") or []:
+        last = (status.get("lastState") or {}).get("terminated")
+        if last:
+            lines.append(
+                f"Last exit {status.get('name')}: {last.get('reason') or '-'} "
+                f"code {last.get('exitCode')} {last.get('message') or ''}".rstrip()
+            )
+    return lines
+
+
+def warning_lines(events):
+    rows = []
+    for event in events.get("items") or []:
+        if event.get("type") != "Warning":
+            continue
+        when = event.get("lastTimestamp") or event.get("eventTime") or ""
+        involved = event.get("involvedObject") or {}
+        who = f"{involved.get('namespace') or '-'}/{involved.get('name') or '-'}"
+        rows.append((when, f"{when}  {who}  {event.get('reason') or '-'}  {event.get('message') or ''}"))
+    rows.sort()
+    return [line for _, line in rows[-30:]] or ["No warnings."]
+
+
+def clip(text, width):
+    if width <= 0:
+        return ""
+    return text[:width]
+
+
+def as_pieces(line):
+    if isinstance(line, str):
+        return [(line, "")]
+    return line
+
+
+def line_length(line):
+    return sum(len(text) for text, _kind in as_pieces(line))
+
+
+USE_COLOR = False
+
+
+def kind_attr(kind):
+    if not USE_COLOR:
+        if kind in ("title", "bold", "ok", "warn", "bad"):
+            return curses.A_BOLD
+        if kind == "dim":
+            return curses.A_DIM
+        return curses.A_NORMAL
+    if kind == "title":
+        return curses.color_pair(1) | curses.A_BOLD
+    if kind == "ok":
+        return curses.color_pair(2) | curses.A_BOLD
+    if kind == "warn":
+        return curses.color_pair(3) | curses.A_BOLD
+    if kind == "bad":
+        return curses.color_pair(4) | curses.A_BOLD
+    if kind == "dim":
+        return curses.A_DIM
+    if kind == "bold":
+        return curses.A_BOLD
+    if kind == "accent":
+        return curses.color_pair(1)
+    return curses.A_NORMAL
+
+
+def draw_pieces(stdscr, y, line, hscroll=0, reverse=False):
+    height, width = stdscr.getmaxyx()
+    if y < 0 or y >= height or width < 2:
+        return
+    limit = width - 1
+    base = curses.A_REVERSE if reverse else 0
+    try:
+        if reverse:
+            stdscr.addnstr(y, 0, " " * limit, limit, base)
+        skip = hscroll
+        x = 0
+        for text, kind in as_pieces(line):
+            if not text:
+                continue
+            if skip >= len(text):
+                skip -= len(text)
+                continue
+            if skip:
+                text = text[skip:]
+                skip = 0
+            room = limit - x
+            if room <= 0:
+                break
+            shown = text[:room]
+            stdscr.addnstr(y, x, shown, len(shown), kind_attr(kind) | base)
+            x += len(shown)
+        if not reverse:
+            stdscr.move(y, min(x, limit))
+            stdscr.clrtoeol()
+    except curses.error:
+        pass
+
+
+def clear_terminal():
+    """Blank the screen before ordinary command output is printed."""
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write("\033[H\033[2J\033[3J")
+    sys.stdout.flush()
+
+
+def wrap_text(text, width):
+    width = max(8, width)
+    lines = []
+    for paragraph in str(text).splitlines() or [""]:
+        current = ""
+        for word in paragraph.split():
+            trial = word if not current else current + " " + word
+            if len(trial) <= width:
+                current = trial
+                continue
+            if current:
+                lines.append(current)
+            current = word
+        lines.append(current)
+    return lines or [""]
+
+
+def prompt(stdscr, question):
+    """Ask on the bottom line. Wait for Enter even if the screen was on a timer."""
+    height, width = stdscr.getmaxyx()
+    y = height - 1
+    shown = clip(question, max(1, width - 8))
+    stdscr.timeout(-1)
+    try:
+        curses.echo()
+        curses.curs_set(1)
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        stdscr.addnstr(y, 0, shown, width - 1)
+        stdscr.refresh()
+        raw = stdscr.getstr(y, min(len(shown) + 1, width - 2))
+    except (KeyboardInterrupt, curses.error):
+        return ""
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+    return raw.decode(errors="replace").strip()
+
+
+def draw_note(stdscr, title, text):
+    """Paint a short warning. The caller asks for the next key."""
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    draw_pieces(stdscr, 0, [(title, "title")])
+    row = 2
+    for line in wrap_text(text, max(8, width - 2)):
+        if row >= height - 2:
+            break
+        draw_pieces(stdscr, row, [(line, "warn")])
+        row += 1
+    stdscr.refresh()
+
+
+def show_note(stdscr, title, text):
+    """Show a short warning on its own screen. Enter or q leaves it."""
+    while True:
+        draw_note(stdscr, title, text)
+        height, _width = stdscr.getmaxyx()
+        draw_pieces(stdscr, height - 1, [("Press Enter.", "dim")])
+        stdscr.refresh()
+        stdscr.timeout(-1)
+        try:
+            key = read_key(stdscr)
+        except KeyboardInterrupt:
+            return
+        if key in (-1, curses.KEY_RESIZE):
+            continue
+        return
+
+
+def read_key(stdscr):
+    """Return one key. Join an xterm arrow that arrived as separate bytes.
+
+    With a getch timeout, keypad mode leaves a right arrow as Escape, '[', 'C'
+    instead of KEY_RIGHT. Treating that first byte as Escape would leave the
+    screen. A bare Escape, with nothing after it, stays 27.
+    The caller sets the timeout before each call. This waits a short time only
+    for the bytes that follow Escape.
+    """
+    key = stdscr.getch()
+    if key != 27:
+        return key
+    stdscr.timeout(40)
+    second = stdscr.getch()
+    if second < 0:
+        return 27
+    third = stdscr.getch()
+    if third < 0:
+        return 27
+    if second in (ord("["), ord("O")):
+        arrows = {
+            ord("A"): curses.KEY_UP,
+            ord("B"): curses.KEY_DOWN,
+            ord("C"): curses.KEY_RIGHT,
+            ord("D"): curses.KEY_LEFT,
+        }
+        if third in arrows:
+            return arrows[third]
+        if second == ord("[") and third == ord("5"):
+            stdscr.getch()
+            return curses.KEY_PPAGE
+        if second == ord("[") and third == ord("6"):
+            stdscr.getch()
+            return curses.KEY_NPAGE
+        if second == ord("[") and third == ord("H"):
+            return curses.KEY_HOME
+        if second == ord("[") and third == ord("F"):
+            return curses.KEY_END
+        if second == ord("[") and third == ord("1"):
+            if stdscr.getch() == ord("~"):
+                return curses.KEY_HOME
+        if second == ord("[") and third == ord("4"):
+            if stdscr.getch() == ord("~"):
+                return curses.KEY_END
+    stdscr.timeout(0)
+    for _ in range(6):
+        if stdscr.getch() < 0:
+            break
+    return -1
+
+
+def screen_title(title):
+    if isinstance(title, dict):
+        return title.get("title") or ""
+    return title
+
+
+def scroll_screen(stdscr, title, lines, refresh=None, on_key=None, hint=None, start="top"):
+    vscroll = 0 if start != "end" else 10 ** 9
+    hscroll = 0
+    fresh = True
+    drawn = None
+    hint = hint or "up/down move    left/right scroll    page up/down    q back    ? help"
+    while True:
+        height, width = stdscr.getmaxyx()
+        if height < 6 or width < 24:
+            stdscr.erase()
+            draw_pieces(stdscr, 0, [("Make this terminal bigger. q goes back.", "warn")])
+            stdscr.refresh()
+            stdscr.timeout(-1)
+            try:
+                key = read_key(stdscr)
+            except KeyboardInterrupt:
+                return
+            if key in (3, 27, ord("q"), ord("Q")):
+                return
+            drawn = None
+            continue
+        window = max(1, height - 3)
+        # Stay at the bottom while new lines arrive, until the reader scrolls up.
+        at_end = start == "end" and drawn is None
+        if lines:
+            at_end = vscroll >= max(0, len(lines) - window)
+        if refresh and fresh:
+            if drawn is None and not lines:
+                stdscr.erase()
+                draw_pieces(stdscr, 0, [(screen_title(title) or "Please wait", "title")])
+                draw_pieces(stdscr, 2, [("Reading the cluster...", "dim")])
+                stdscr.refresh()
+            try:
+                lines = refresh()
+            except Exception as error:
+                lines = [str(error).splitlines()[0] if str(error) else "The cluster did not answer."]
+            if at_end:
+                vscroll = 10 ** 9
+        fresh = False
+        widest = max((line_length(line) for line in lines), default=0)
+        vscroll = max(0, min(vscroll, max(0, len(lines) - window)))
+        hscroll = max(0, min(hscroll, max(0, widest - width + 1)))
+        shown_hint = hint
+        if hscroll or widest > width:
+            shown_hint += f"    column {hscroll + 1}"
+        last = min(vscroll + window, len(lines))
+        footer = f"{min(vscroll + 1, len(lines))}-{last} of {len(lines)}" if lines else "empty"
+        signature = (
+            screen_title(title), shown_hint, footer, vscroll, hscroll, height, width,
+            tuple(tuple(as_pieces(line)) for line in lines),
+        )
+        if signature != drawn:
+            stdscr.erase()
+            draw_pieces(stdscr, 0, [(screen_title(title), "title")])
+            draw_pieces(stdscr, 1, [(shown_hint, "dim")])
+            for offset in range(window):
+                index = vscroll + offset
+                if index < len(lines):
+                    draw_pieces(stdscr, 2 + offset, lines[index], hscroll)
+            draw_pieces(stdscr, height - 1, [(footer, "dim")])
+            stdscr.refresh()
+            drawn = signature
+        stdscr.timeout(REFRESH_MS if refresh else -1)
+        try:
+            key = read_key(stdscr)
+        except KeyboardInterrupt:
+            return
+        action = on_key(key) if on_key and key != -1 else None
+        if action in ("refresh", "home"):
+            if action == "home":
+                vscroll = 0
+                hscroll = 0
+            fresh = True
+            drawn = None
+            continue
+        if action == "close" or key in (3, 27, ord("q"), ord("Q")):
+            return
+        if key == -1:
+            fresh = refresh is not None
+            continue
+        if key == ord("?"):
+            help_screen(stdscr)
+            drawn = None
+            continue
+        if key == curses.KEY_LEFT:
+            hscroll = max(0, hscroll - 8)
+        elif key == curses.KEY_RIGHT:
+            hscroll += 8
+        elif key in (curses.KEY_UP, ord("k")):
+            vscroll = max(0, vscroll - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            vscroll += 1
+        elif key in (curses.KEY_PPAGE, ord("b")):
+            vscroll = max(0, vscroll - window)
+        elif key in (curses.KEY_NPAGE, ord(" "), ord("f")):
+            vscroll += window
+        elif key in (curses.KEY_HOME, ord("g")):
+            vscroll = 0
+        elif key in (curses.KEY_END, ord("G")):
+            vscroll = 10 ** 9
+        elif key == ord("r") and refresh:
+            fresh = True
+            drawn = None
+        elif key == curses.KEY_RESIZE:
+            drawn = None
+
+
+def suspend(stdscr, action):
+    """Leave the panel, clear the terminal, then print the command's own text."""
+    curses.def_prog_mode()
+    curses.endwin()
+    clear_terminal()
+    error = None
+    try:
+        action()
+    except KeyboardInterrupt:
+        error = "Stopped."
+    except Exception as exc:
+        error = str(exc).splitlines()[0] if str(exc) else "The command failed."
+        print()
+        print(exc)
+    print()
+    print("Press Enter to return to the panel.")
+    try:
+        sys.stdin.readline()
+    except KeyboardInterrupt:
+        error = error or "Stopped."
+    clear_terminal()
+    curses.reset_prog_mode()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.erase()
+    stdscr.refresh()
+    return error
+
+
+def show_command(stdscr, title, action):
+    def wrapped():
+        print(title, flush=True)
+        print("-" * min(max(len(title), 3), 72), flush=True)
+        print(flush=True)
+        action()
+
+    return suspend(stdscr, wrapped)
+
+
+HELP_LINES = [
+    "Menu",
+    "  Up and down move the highlight. Enter opens it.",
+    "  A number opens that item at once. q or Ctrl+C leaves.",
+    "  r reads the cluster again.",
+    "",
+    "Live map",
+    "  Up and down move. Left and right scroll a wide line.",
+    "  Page Up and Page Down move a page. Home and End jump.",
+    "  h hides or shows kube-system and ingress.",
+    "  / finds text in a pod name. A blank find shows every pod.",
+    "  r refreshes now. The map also refreshes every 2 seconds.",
+    "  q goes back to the menu.",
+    "",
+    "Lists",
+    "  Up and down highlight a row. Enter chooses it.",
+    "  Type a number and press Enter to jump to that row.",
+    "  / finds text. A blank find shows the whole list again.",
+    "  q goes back.",
+    "",
+    "Commands",
+    "  Logs, warnings, status, and why-not-ready stay on this screen.",
+    "  Scale, restart, start, and stop clear the terminal first,",
+    "  then print the command. Press Enter there to come back.",
+    "  Stop still needs the word stop.",
+    "  A database scale away from 1 still needs YES.",
+]
+
+
+MENU = [
+    ("1", "Live map", "nodes, pods, services, and ingress"),
+    ("2", "Scale", "set how many pods each app should have"),
+    ("3", "Events", "recent warnings"),
+    ("4", "Logs", "last lines from one pod"),
+    ("5", "Restart", "replace the pods of one app"),
+    ("6", "Why not ready", "why a pod is waiting or crashing"),
+    ("7", "Status", "microk8s status"),
+    ("8", "Stop cluster", "asks first, then frees the memory"),
+    ("9", "Start cluster", "start MicroK8s and wait until the node is Ready"),
+    ("0", "Quit", "leave the panel"),
+]
+
+MENU_SECTIONS = [
+    ("", 0, 2),
+    ("Details", 2, 7),
+    ("Cluster", 7, 9),
+    ("", 9, 10),
+]
+
+
+def help_screen(stdscr):
+    scroll_screen(stdscr, "Keys", HELP_LINES, hint="q back")
+
+
+def setup_screen(stdscr):
+    global USE_COLOR
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.keypad(True)
+    USE_COLOR = False
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        background = -1
+    except curses.error:
+        background = curses.COLOR_BLACK
+    try:
+        curses.init_pair(1, curses.COLOR_CYAN, background)
+        curses.init_pair(2, curses.COLOR_GREEN, background)
+        curses.init_pair(3, curses.COLOR_YELLOW, background)
+        curses.init_pair(4, curses.COLOR_RED, background)
+    except curses.error:
+        return
+    USE_COLOR = True
+
+
+def load_headline(stdscr, cluster):
+    stdscr.erase()
+    draw_pieces(stdscr, 0, [("Reading the cluster...", "dim")])
+    stdscr.refresh()
+    if not cluster.available():
+        return [("MicroK8s is not installed on this Pi.", "bad")]
+    try:
+        nodes = cluster.json(["kubectl", "get", "nodes"], timeout=25).get("items") or []
+        pods = cluster.json(["kubectl", "get", "pods", "-A"], timeout=25).get("items") or []
+    except Exception as error:
+        message = str(error).splitlines()[0] if str(error) else "The cluster did not answer."
+        return [(message, "bad")]
+    ready_nodes = sum(1 for node in nodes if node_ready(node) == "Ready")
+    names = ", ".join(node["metadata"]["name"] for node in nodes) or "no node"
+    running = sum(1 for pod in pods if pod_status(pod) == "Running")
+    node_kind = "ok" if nodes and ready_nodes == len(nodes) else "warn"
+    pod_kind = "ok" if pods and running == len(pods) else "warn"
+    pieces = [
+        (names, "title"),
+        (f"    nodes {ready_nodes}/{len(nodes)}", node_kind),
+        (f"    pods running {running}/{len(pods)}", pod_kind),
+    ]
+    try:
+        if compose_neo4j_running():
+            pieces.append(("    Compose Neo4j is running", "warn"))
+    except Exception:
+        pass
+    return pieces
+
+
+def draw_menu(stdscr, headline, notice, selected):
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    if height < 20 or width < 36:
+        draw_pieces(stdscr, 0, [("Make this terminal bigger. q quits.", "warn")])
+        stdscr.refresh()
+        return
+    draw_pieces(stdscr, 0, [("Sara cluster", "title")])
+    stamp = time.strftime("%H:%M")
+    if width > len(stamp) + 2:
+        try:
+            stdscr.addnstr(0, max(0, width - len(stamp) - 1), stamp, len(stamp), kind_attr("dim"))
+        except curses.error:
+            pass
+    draw_pieces(stdscr, 1, headline)
+    draw_pieces(stdscr, 2, [("up/down move  Enter opens  number jumps  r refresh  ? help  q quit", "dim")])
+    row = 4
+    first = True
+    for title, start, end in MENU_SECTIONS:
+        if not first and row < height - 1:
+            row += 1
+        first = False
+        if title and row < height - 1:
+            draw_pieces(stdscr, row, [(title, "accent")])
+            row += 1
+        for index in range(start, end):
+            if row >= height - 1:
+                break
+            number, label, detail = MENU[index]
+            marker = "> " if index == selected else "  "
+            draw_pieces(
+                stdscr,
+                row,
+                [(f"{marker}{number}  {label:<16}", "bold"), (detail, "dim")],
+                reverse=index == selected,
+            )
+            row += 1
+    if notice:
+        lowered = notice.lower()
+        kind = "warn" if lowered.startswith(("not ", "that ", "type ", "stopped", "the command")) else "ok"
+        draw_pieces(stdscr, height - 1, [(notice, kind)])
+    else:
+        draw_pieces(stdscr, height - 1, [(f"{selected + 1} of {len(MENU)}", "dim")])
+    stdscr.refresh()
+
+
+def choose(stdscr, cluster, notice):
+    selected = 0
+    headline = load_headline(stdscr, cluster)
+    while True:
+        draw_menu(stdscr, headline, notice, selected)
+        stdscr.timeout(-1)
+        try:
+            key = read_key(stdscr)
+        except KeyboardInterrupt:
+            return "0"
+        if key in (curses.KEY_RESIZE, -1):
+            continue
+        notice = ""
+        if key in (3, 27, ord("q"), ord("Q")):
+            return "0"
+        if key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % len(MENU)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % len(MENU)
+        elif key in (10, 13, curses.KEY_ENTER):
+            return MENU[selected][0]
+        elif key == ord("?"):
+            help_screen(stdscr)
+        elif key == ord("r"):
+            headline = load_headline(stdscr, cluster)
+        elif 48 <= key <= 57:
+            number = chr(key)
+            for item in MENU:
+                if item[0] == number:
+                    return number
+        elif key == curses.KEY_HOME:
+            selected = 0
+        elif key == curses.KEY_END:
+            selected = len(MENU) - 1
+
+
+def live_map(stdscr, cluster):
+    holder = {"title": "Live map", "hide": False, "query": ""}
+
+    def refresh():
+        parts = ["Live map", "every 2 seconds"]
+        if holder["hide"]:
+            parts.append("system pods hidden")
+        if holder["query"]:
+            parts.append("find " + holder["query"])
+        parts.append(time.strftime("%H:%M:%S"))
+        holder["title"] = "    ".join(parts)
+        nodes = cluster.json(["kubectl", "get", "nodes"]).get("items") or []
+        pods = cluster.json(["kubectl", "get", "pods", "-A"]).get("items") or []
+        services = cluster.json(["kubectl", "get", "svc", "-A"]).get("items") or []
+        ingresses = cluster.json(["kubectl", "get", "ingress", "-A"]).get("items") or []
+        lines = build_map(
+            nodes, pods, services, ingresses,
+            hide_system=holder["hide"], query=holder["query"],
+        )
+        if compose_neo4j_running():
+            lines.append([("", "")])
+            lines.append([("Compose Neo4j is running. Do not start a second database.", "warn")])
+        return lines
+
+    def on_key(key):
+        if key == ord("h"):
+            holder["hide"] = not holder["hide"]
+            return "home"
+        if key == ord("/"):
+            holder["query"] = prompt(stdscr, "Find pod: ")
+            return "home"
+        if key == ord("r"):
+            return "refresh"
+        return None
+
+    scroll_screen(
+        stdscr,
+        holder,
+        [],
+        refresh=refresh,
+        on_key=on_key,
+        hint="up/down move    left/right scroll    h system    / find    r refresh    q back",
+    )
+
+
+def entry_plain(entry):
+    return "".join(text for text, _kind in as_pieces(entry))
+
+
+def filter_indices(entries, query):
+    needle = query.strip().lower()
+    if not needle:
+        return list(range(len(entries)))
+    return [index for index, entry in enumerate(entries) if needle in entry_plain(entry).lower()]
+
+
+def pick_from(stdscr, title, preamble, entries):
+    """Highlight a row. Enter returns its index. q cancels. / filters the list."""
+    if not entries:
+        scroll_screen(stdscr, title, list(preamble) + ["Nothing to choose."])
+        return None
+    selected = 0
+    vscroll = 0
+    typed = ""
+    note = ""
+    query = ""
+    while True:
+        visible = filter_indices(entries, query)
+        if selected >= len(visible):
+            selected = max(0, len(visible) - 1)
+        stdscr.erase()
+        height, _width = stdscr.getmaxyx()
+        draw_pieces(stdscr, 0, [(title, "title")])
+        draw_pieces(stdscr, 1, [("up/down highlight    Enter chooses    / find    number jumps    q back", "dim")])
+        row = 2
+        if query:
+            draw_pieces(stdscr, row, [(f"Find: {query}", "dim")])
+            row += 1
+        for line in preamble[:4]:
+            if row >= height - 2:
+                break
+            draw_pieces(stdscr, row, [(line, "dim")] if isinstance(line, str) else line)
+            row += 1
+        window = max(1, height - row - 1)
+        if not visible:
+            draw_pieces(stdscr, row, [("No match. / clears the find.", "warn")])
+        else:
+            if selected < vscroll:
+                vscroll = selected
+            elif selected >= vscroll + window:
+                vscroll = selected - window + 1
+            vscroll = max(0, min(vscroll, max(0, len(visible) - window)))
+            for offset in range(window):
+                index = vscroll + offset
+                if index >= len(visible):
+                    break
+                draw_pieces(stdscr, row + offset, entries[visible[index]], reverse=index == selected)
+        if visible:
+            footer = f"{selected + 1} of {len(visible)}"
+        else:
+            footer = "0 of 0"
+        if typed:
+            footer = f"Number: {typed}    {footer}"
+        if note:
+            footer = f"{note}    {footer}"
+        draw_pieces(stdscr, height - 1, [(footer, "warn" if note else "dim")])
+        stdscr.refresh()
+        stdscr.timeout(-1)
+        try:
+            key = read_key(stdscr)
+        except KeyboardInterrupt:
+            return None
+        if key == 27 and query:
+            query = ""
+            selected = 0
+            typed = ""
+            note = ""
+            continue
+        if key in (3, 27, ord("q"), ord("Q")):
+            return None
+        if key == ord("/"):
+            query = prompt(stdscr, "Find: ")
+            selected = 0
+            vscroll = 0
+            typed = ""
+            note = ""
+            continue
+        if key in (10, 13, curses.KEY_ENTER):
+            if not visible:
+                note = "No match."
+                continue
+            if typed:
+                if typed.isdigit() and 1 <= int(typed) <= len(entries) and (int(typed) - 1) in visible:
+                    return int(typed) - 1
+                note = "That number is not on the list."
+                continue
+            return visible[selected]
+        note = ""
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            typed = typed[:-1]
+            if typed.isdigit() and 1 <= int(typed) <= len(entries) and (int(typed) - 1) in visible:
+                selected = visible.index(int(typed) - 1)
+        elif 48 <= key <= 57 and len(typed) < 4:
+            typed += chr(key)
+            if typed.isdigit() and 1 <= int(typed) <= len(entries) and (int(typed) - 1) in visible:
+                selected = visible.index(int(typed) - 1)
+        elif key in (curses.KEY_UP, ord("k")) and visible:
+            selected = max(0, selected - 1)
+            typed = ""
+        elif key in (curses.KEY_DOWN, ord("j")) and visible:
+            selected = min(len(visible) - 1, selected + 1)
+            typed = ""
+        elif key in (curses.KEY_PPAGE, ord("b")) and visible:
+            selected = max(0, selected - window)
+            typed = ""
+        elif key in (curses.KEY_NPAGE, ord(" "), ord("f")) and visible:
+            selected = min(len(visible) - 1, selected + window)
+            typed = ""
+        elif key in (curses.KEY_HOME, ord("g")):
+            selected = 0
+            typed = ""
+        elif key in (curses.KEY_END, ord("G")) and visible:
+            selected = len(visible) - 1
+            typed = ""
+
+
+def busy(stdscr, text):
+    stdscr.erase()
+    draw_pieces(stdscr, 0, [(text, "dim")])
+    stdscr.refresh()
+
+
+def pick_workload(stdscr, cluster, purpose):
+    busy(stdscr, "Reading workloads...")
+    deployments = cluster.json(["kubectl", "get", "deploy", "-A"])
+    statefulsets = cluster.json(["kubectl", "get", "sts", "-A"])
+    rows = workload_rows(deployments, statefulsets)
+    preamble = [
+        "A Deployment owns stateless pods such as the site and the API.",
+        "A StatefulSet owns database pods. Each one keeps its own disk.",
+        "You set the count on the controller. Kubernetes adds or removes pods.",
+        "DaemonSets such as Traefik stay at one pod per node and are not listed.",
+    ]
+    if not any(row["namespace"] not in LOCKED_NAMESPACES for row in rows):
+        preamble.append("No website workloads yet.")
+    entries = []
+    for index, row in enumerate(rows, start=1):
+        locked = row["namespace"] in LOCKED_NAMESPACES
+        pieces = [(
+            f"{index:>2}  {row['kind']:<12} {row['namespace']}/{row['name']}"
+            f"    ready {row['ready']}/{row['replicas']}",
+            "dim" if locked else "",
+        )]
+        if locked:
+            pieces.append(("  locked", "warn"))
+        entries.append(pieces)
+    chosen = pick_from(stdscr, purpose, preamble, entries)
+    if chosen is None:
+        return None
+    return rows[chosen]
+
+
+def scale_screen(stdscr, cluster):
+    chosen = pick_workload(stdscr, cluster, "Scale")
+    if not chosen:
+        return ""
+    who = f"{chosen['namespace']}/{chosen['name']}"
+    decision, message = scale_decision(
+        chosen["kind"], chosen["namespace"], chosen["name"], chosen["replicas"], compose_neo4j_running()
+    )
+    if decision == "locked":
+        show_note(stdscr, "Not scaled", message)
+        return "Not scaled."
+    raw = prompt(stdscr, f"How many pods for {who}? ")
+    if not raw or not raw.isdigit():
+        return "Type a whole number, 0 or more."
+    desired = int(raw)
+    decision, message = scale_decision(
+        chosen["kind"], chosen["namespace"], chosen["name"], desired, compose_neo4j_running()
+    )
+    if decision == "reject":
+        show_note(stdscr, "Not scaled", message)
+        return "Not scaled."
+    if decision == "confirm":
+        draw_note(stdscr, "Read this before scaling", message)
+        typed = prompt(stdscr, "Type YES to continue: ")
+        if typed != "YES":
+            return "Not changed."
+    kind = "deployment" if chosen["kind"] == "Deployment" else "statefulset"
+    target = f"{kind}/{chosen['name']}"
+
+    def action():
+        if message:
+            print(message)
+            print()
+        print(f"Setting {who} to {desired} pod(s).")
+        cluster.visible([
+            "kubectl", "scale", target, "-n", chosen["namespace"], f"--replicas={desired}",
+        ])
+        cluster.visible([
+            "kubectl", "rollout", "status", target, "-n", chosen["namespace"], "--timeout=120s",
+        ])
+
+    problem = show_command(stdscr, f"Scale {who} to {desired}", action)
+    if problem:
+        return problem
+    return f"{who} set to {desired}."
+
+
+def events_screen(stdscr, cluster):
+    def refresh():
+        rows = warning_lines(cluster.json(["kubectl", "get", "events", "-A"]))
+        return [[(line, "warn" if line != "No warnings." else "dim")] for line in rows]
+
+    scroll_screen(
+        stdscr,
+        {"title": "Warnings"},
+        [],
+        refresh=refresh,
+        start="end",
+        hint="up/down move    r refresh    q back",
+    )
+
+
+def pick_pod(stdscr, cluster, title):
+    busy(stdscr, "Reading pods...")
+    data = cluster.json(["kubectl", "get", "pods", "-A"])
+    pods = sorted(data.get("items") or [], key=lambda item: (
+        item["metadata"]["namespace"], item["metadata"]["name"]
+    ))
+    entries = []
+    for index, pod in enumerate(pods, start=1):
+        meta = pod["metadata"]
+        status = pod_status(pod)
+        entries.append([
+            (f"{index:>2}  {meta['namespace']}/{meta['name']}    ", ""),
+            (status, status_kind(status)),
+        ])
+    chosen = pick_from(stdscr, title, [], entries)
+    if chosen is None:
+        return None
+    return pods[chosen]
+
+
+def logs_screen(stdscr, cluster):
+    pod = pick_pod(stdscr, cluster, "Logs")
+    if not pod:
+        return ""
+    meta = pod["metadata"]
+    busy(stdscr, "Reading logs...")
+    result = cluster.run(
+        ["kubectl", "logs", "-n", meta["namespace"], meta["name"], "--tail=120", "--all-containers=true"],
+        check=False,
+        timeout=30,
+    )
+    text = ((result.stdout or "") + (result.stderr or "")).strip() or "(no log lines)"
+    scroll_screen(
+        stdscr,
+        f"Logs  {meta['namespace']}/{meta['name']}",
+        text.splitlines(),
+        start="end",
+    )
+    return ""
+
+
+def restart_screen(stdscr, cluster):
+    chosen = pick_workload(stdscr, cluster, "Restart")
+    if not chosen:
+        return ""
+    who = f"{chosen['namespace']}/{chosen['name']}"
+    if chosen["namespace"] in LOCKED_NAMESPACES:
+        show_note(stdscr, "Not restarted", f"{who} belongs to the cluster itself.")
+        return "Not restarted."
+    typed = prompt(stdscr, f"Restart {who}? Type y: ")
+    if typed.lower() != "y":
+        return "Not restarted."
+    kind = "deployment" if chosen["kind"] == "Deployment" else "statefulset"
+    target = f"{kind}/{chosen['name']}"
+
+    def action():
+        print(f"Replacing pods for {who}. The Service name stays.")
+        cluster.visible(["kubectl", "rollout", "restart", target, "-n", chosen["namespace"]])
+        cluster.visible([
+            "kubectl", "rollout", "status", target, "-n", chosen["namespace"], "--timeout=120s",
+        ])
+
+    problem = show_command(stdscr, f"Restart {who}", action)
+    if problem:
+        return problem
+    return f"Restarted {who}."
+
+
+def why_screen(stdscr, cluster):
+    pod = pick_pod(stdscr, cluster, "Why not ready")
+    if not pod:
+        return ""
+    meta = pod["metadata"]
+    busy(stdscr, "Reading the pod...")
+    fresh = cluster.json(["kubectl", "get", "pod", "-n", meta["namespace"], meta["name"]])
+    lines = []
+    for line in pod_reason(fresh):
+        kind = "bad" if any(word in line for word in ("False", "Error", "BackOff", "Fail", "OOM")) else ""
+        lines.append([(line, kind)])
+    scroll_screen(stdscr, f"Why not ready  {meta['namespace']}/{meta['name']}", lines)
+    return ""
+
+
+def status_screen(stdscr, cluster):
+    busy(stdscr, "Reading status...")
+    result = cluster.run(["status"], check=False, timeout=40)
+    text = ((result.stdout or "") + (result.stderr or "")).strip() or "(no status)"
+    scroll_screen(stdscr, "Status", text.splitlines())
+    return ""
+
+
+def stop_screen(stdscr, cluster):
+    typed = prompt(stdscr, "Type stop to shut the cluster down: ")
+    if typed != "stop":
+        return "Not stopped."
+    problem = show_command(stdscr, "Stop the cluster", lambda: cluster.visible(["stop"]))
+    if problem:
+        return problem
+    return "Cluster stopped."
+
+
+def start_screen(stdscr, cluster):
+    def action():
+        print("Starting MicroK8s.")
+        cluster.visible(["start"], timeout=180)
+        print()
+        print("Waiting until the node is Ready.")
+        cluster.visible(["status", "--wait-ready"], timeout=180)
+
+    problem = show_command(stdscr, "Start the cluster", action)
+    if problem:
+        return problem
+    return "Cluster is up."
+
+
+def dispatch(stdscr, cluster, choice):
+    screens = {
+        "1": live_map,
+        "2": scale_screen,
+        "3": events_screen,
+        "4": logs_screen,
+        "5": restart_screen,
+        "6": why_screen,
+        "7": status_screen,
+        "8": stop_screen,
+        "9": start_screen,
+    }
+    screen = screens.get(choice)
+    if not screen:
+        return ""
+    return screen(stdscr, cluster) or ""
+
+
+def plain_menu():
+    print("Sara cluster panel")
+    print("This needs your own terminal.")
+    print("Open an SSH session and run ~/k8s/panel")
+    print("Up and down move. Enter opens. A number jumps. q quits.")
+    for number, label, detail in MENU:
+        print(f"  {number}  {label}    {detail}".rstrip())
+
+
+def main(stdscr):
+    setup_screen(stdscr)
+    stdscr.erase()
+    draw_pieces(stdscr, 0, [("Opening the panel...", "dim")])
+    stdscr.refresh()
+    cluster = Cluster()
+    notice = ""
+    while True:
+        choice = choose(stdscr, cluster, notice)
+        notice = ""
+        if choice == "0":
+            return
+        try:
+            notice = dispatch(stdscr, cluster, choice) or ""
+        except KeyboardInterrupt:
+            notice = ""
+        except RuntimeError as error:
+            notice = str(error).splitlines()[0] if str(error) else "That did not work."
+
+
+if __name__ == "__main__":
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        plain_menu()
+        sys.exit(0)
+    try:
+        curses.wrapper(main)
+        print("Panel closed.")
+    except KeyboardInterrupt:
+        print()
+        print("Panel closed.")
+        sys.exit(0)

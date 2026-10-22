@@ -15,7 +15,7 @@ function shiftMonth(month, delta) {
 
 function monthTitle(month) {
   const [year, monthNumber] = month.split('-').map(Number);
-  return new Date(Date.UTC(year, monthNumber - 1, 1)).toLocaleString('en', {
+  return new Date(Date.UTC(year, monthNumber - 1, 1)).toLocaleString('nl-BE', {
     month: 'long',
     year: 'numeric',
     timeZone: 'UTC',
@@ -40,6 +40,12 @@ function buildCells(month, byDate) {
   return cells;
 }
 
+function localError(message) {
+  if (message === 'That date is already booked.') return t.alreadyBooked;
+  if (message === 'Something went wrong.') return t.formError;
+  return message || t.formError;
+}
+
 export default function Booking() {
   const [month, setMonth] = useState(currentMonth);
   const [days, setDays] = useState(null);
@@ -58,7 +64,7 @@ export default function Booking() {
         if (!ignore) setDays(body.days);
       })
       .catch((err) => {
-        if (!ignore) setError(err.message);
+        if (!ignore) setError(localError(err.message));
       });
     return () => {
       ignore = true;
@@ -79,7 +85,7 @@ export default function Booking() {
       const body = await getJson(`/api/availability?month=${month}`);
       setDays(body.days);
     } catch (err) {
-      setError(err.message || t.formError);
+      setError(localError(err.message));
     } finally {
       setSending(false);
     }
@@ -89,9 +95,8 @@ export default function Booking() {
   const cells = days ? buildCells(month, byDate) : [];
 
   return (
-    <>
-      <p className="kicker">{t.bookingLead}</p>
-      <h1>{t.navBooking}</h1>
+    <section className="booking">
+      <h1 className="script">{t.bookingTitle}</h1>
       <p className="lede">{t.bookingHint}</p>
       <div className="month-bar">
         <button type="button" onClick={() => setMonth(shiftMonth(month, -1))}>{t.previousMonth}</button>
@@ -102,7 +107,7 @@ export default function Booking() {
       {message && <p className="banner ok">{message}</p>}
       {!days && !error && <p className="muted">{t.loading}</p>}
       {days && (
-        <div className="calendar" role="grid">
+        <div className="calendar" role="grid" aria-label={monthTitle(month)}>
           {t.weekday.map((label) => (
             <div key={label} className="weekday">{label}</div>
           ))}
@@ -121,7 +126,9 @@ export default function Booking() {
                   aria-pressed={selected === cell.date}
                 >
                   <span>{cell.day}</span>
-                  <small>{cell.state === 'taken' ? t.taken : cell.state === 'free' ? t.free : t.closed}</small>
+                  <small>
+                    {cell.state === 'taken' ? t.taken : cell.state === 'free' ? t.free : t.closed}
+                  </small>
                 </button>
               )
               : <div key={`pad-${index}`} />
@@ -140,11 +147,11 @@ export default function Booking() {
             <textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={500} rows={3} />
           </label>
           <p className="note">{t.noteHint}</p>
-          <button type="submit" className="primary" disabled={sending}>
+          <button type="submit" className="btn" disabled={sending}>
             {sending ? t.sending : t.requestDate}
           </button>
         </form>
       )}
-    </>
+    </section>
   );
 }

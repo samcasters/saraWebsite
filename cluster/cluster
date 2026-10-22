@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Control and monitor the MicroK8s cluster on this Pi.
+# Usage: ~/k8s/cluster [command]
+set -euo pipefail
+
+MOUNT=/mnt/sara-usb
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [[ -f "$SCRIPT_DIR/../compose.yaml" ]]; then
+  SITE_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+else
+  SITE_ROOT=/home/EVE/saraWebsite
+fi
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  OFF=$'\033[0m'
+else
+  BOLD=''
+  DIM=''
+  OFF=''
+fi
+
+say() { printf '%s%s%s\n' "$BOLD" "$*" "$OFF"; }
+
+find_microk8s() {
+  if command -v microk8s >/dev/null 2>&1; then
+    command -v microk8s
+  elif [[ -x /snap/bin/microk8s ]]; then
+    echo /snap/bin/microk8s
+  else
+    return 1
+  fi
+}
+
+kubectl() {
+  "$K8S" kubectl "$@"
+}
+
+require_cluster() {
+  K8S=$(find_microk8s) || {
+    echo "MicroK8s is not installed yet."
+    echo "Install it with: sudo snap install microk8s --classic"
+    exit 1
+  }
+}
+
+machine() {
+  say "This Pi"
+  free -h
+  echo
+  df -h / "$MOUNT" 2>/dev/null || df -h /
+  echo
+  if swapon --show | grep -q .; then
+    swapon --show
+  else
+    echo "Swap is off."
+  fi
+}
+
+dashboard() {
+  machine
+  echo
+  if ! K8S=$(find_microk8s); then
+    say "Cluster"
+    echo "MicroK8s is not installed."
+    echo "When it is, run: $(basename "$0") status"
+    echo
+    say "Compose on this node"
+    compose_ps || true
+    return 0
+  fi
+  say "Node"
+  kubectl get nodes -o wide || true
+  echo
+  say "Sara website"
+  if kubectl get namespace sara >/dev/null 2>&1; then
+    kubectl get pods,svc,ingress -n sara -o wide || true
+  else
+    echo "Namespace sara does not exist yet."
+  fi
+  echo
+  say "Control plane add-ons"
+  kubectl get pods -n kube-system || true
+  echo
+  say "Compose on this node"
+  compose_ps || true
+}
+
+compose_ps() {
+  local compose=/home/EVE/saraWebsite/compose.yaml
+  if docker info >/dev/null 2>&1; then
+    docker compose -f "$compose" ps
+  elif sudo -n docker info >/dev/null 2>&1; then
+    sudo docker compose -f "$compose" ps
+  elif [[ -S /var/run/docker.sock ]]; then
+    echo "Docker is installed. This shell is not in the docker group yet."
+  else
+    echo "Docker is not installed yet."
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [command]
+
+  (no command)     Machine, node, and workloads
+  watch            Repeat that view every 5 seconds. Ctrl-C stops it.
+  status           microk8s status
+  start            Start the cluster
+  stop             Stop the cluster and give the Pi its memory back
+  nodes            The machines in the cluster
+  pods [namespace] Pods. Default namespace is sara. Use -A for all.
+  svc              Services in sara
+  ingress          Ingress in sara
+  events           Recent warnings
+  logs <pod>       Logs for a pod in sara. Add a namespace as the third word.
+  top              CPU and memory, if the metrics add-on is on
+  compose [...]    Docker Compose for the site. No extra words shows the containers.
+
+Examples:
+  $(basename "$0")
+  $(basename "$0") pods -A
+  $(basename "$0") logs neo4j-0
+  $(basename "$0") watch
+  $(basename "$0") compose up -d
+  $(basename "$0") compose down
+EOF
+}
+
+cmd=${1:-dashboard}
+shift || true
+
+case "$cmd" in
+  dashboard)
+    dashboard
+    ;;
+  watch)
+    while true; do
+      clear || true
+      date
+      echo
+      dashboard
+      echo
+      printf '%sRefresh in 5 seconds. Ctrl-C to stop.%s\n' "$DIM" "$OFF"
+      sleep 5
+    done
+    ;;
+  status)
+    require_cluster
+    "$K8S" status
+    ;;
+  start)
+    require_cluster
+    "$K8S" start
+    ;;
+  stop)
+    require_cluster
+    "$K8S" stop
+    ;;
+  nodes)
+    require_cluster
+    kubectl get nodes -o wide
+    ;;
+  pods)
+    require_cluster
+    if [[ ${1:-} == "-A" || ${1:-} == "--all" ]]; then
+      kubectl get pods -A -o wide
+    else
+      kubectl get pods -n "${1:-sara}" -o wide
+    fi
+    ;;
+  svc|services)
+    require_cluster
+    kubectl get svc -n "${1:-sara}" -o wide
+    ;;
+  ingress)
+    require_cluster
+    kubectl get ingress -A
+    ;;
+  events)
+    require_cluster
+    kubectl get events -A --sort-by=.lastTimestamp | tail -n 30
+    ;;
+  logs)
+    require_cluster
+    pod=${1:-}
+    ns=${2:-sara}
+    if [[ -z "$pod" ]]; then
+      echo "Name a pod. Example: $(basename "$0") logs neo4j-0" >&2
+      exit 1
+    fi
+    kubectl logs -n "$ns" "$pod" --tail=80
+    ;;
+  top)
+    require_cluster
+    kubectl top nodes || echo "Node metrics are not available. The metrics-server add-on is off on purpose, to save memory."
+    echo
+    kubectl top pods -A || true
+    ;;
+  compose)
+    cd "$SITE_ROOT"
+    if [[ $# -eq 0 ]]; then
+      set -- ps
+    fi
+    if [[ "$1" == "up" ]]; then
+      bash "$SITE_ROOT/scripts/compose-up.sh"
+    elif docker info >/dev/null 2>&1; then
+      docker compose "$@"
+    elif sudo -n docker info >/dev/null 2>&1; then
+      sudo docker compose "$@"
+    else
+      echo "Docker is not available to this user yet." >&2
+      exit 1
+    fi
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac

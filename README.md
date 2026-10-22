@@ -2,13 +2,27 @@
 
 A small booking site on MicroK8s, built to learn the cluster while the site comes up. The step-by-step guide and the checklist are in [PLAN.md](PLAN.md).
 
+## Start on a new machine
+
+Clone this repo, then run:
+
+```bash
+bash scripts/startup.sh
+```
+
+That installs MicroK8s if it is missing, builds the site, creates the Neo4j password inside the cluster, and starts one web pod, one API pod, and one Neo4j pod. It asks for your sudo password. Run it again any time. It does not print the password, and it does not open ports 7474 or 7687.
+
+The cluster screen is `~/k8s/panel` after the script links that folder. The same files are in `cluster/`.
+
 ## Pages
 
-- `/` pictures of the house and a short explanation of each one
-- `/activities` nearby activities
+The live pages are in Dutch. The strings are in `web/src/i18n/nl.js`.
+
+- `/` the house, the activities, and the booking link
+- `/huis/boven`, `/huis/beneden`, `/huis/inkom`, `/huis/tuin` one area each
 - `/booking` free and taken dates, and a form that saves a request
 
-The pictures and activity text are sample content. English UI strings live in `web/src/i18n/en.js`. The house text lives in `db/seed.cypher`.
+The house photos are in `content/photos/saraPhotos/housPhotos`. `demoWebPhotos` is only the design reference. The old English sample graph is still in `db/seed.cypher`.
 
 ## Where things sit
 

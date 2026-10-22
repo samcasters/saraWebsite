@@ -6,9 +6,11 @@ Learning build on this Raspberry Pi. One node runs the control plane and the sit
 
 The USB is mounted at `/mnt/sara-usb` (ext4, label `sara-data`) with a 1 GB swap file. MicroK8s v1.36.2 is running. Node `walle` is Ready at `10.0.0.32`. Cluster data is bind-mounted from `/mnt/sara-usb/microk8s-common`. User `EVE` is in group `microk8s`. Add-ons dns, hostpath-storage, and ingress are enabled. The control plane is the snap services `kubelite` and `k8s-dqlite`.
 
-Namespace `sara` is up. Neo4j is the StatefulSet pod `neo4j-0`, with its disk on the USB. The API and the website are Deployments. Ingress serves the site at `http://10.0.0.32/`. Compose is stopped, so only one Neo4j is running. Its old files are still at `/mnt/sara-usb/compose/neo4j`.
+Namespace `sara` is up. Neo4j is the StatefulSet pod `neo4j-0`, with its disk on the USB. The API and the website are Deployments. Ingress serves the site at `http://10.0.0.32/`. Compose is stopped, so only one Neo4j is running. Its old files are still at `/mnt/sara-usb/compose/neo4j`. The private repo already has `main`.
 
-Next: forward router TCP port 80 to `10.0.0.32:80`, then create the private GitHub repo and push `main`. HTTPS waits until there is a domain name.
+The pages follow the design pictures in `content/photos/saraPhotos/demoWebPhotos`. The live language is Dutch, the name on the site is Vakantiehuis La Carrière, and the photographs come from `content/photos/saraPhotos/housPhotos`. Booking is the same calendar as before: a name, a date, and a short note.
+
+Next: forward router TCP port 80 to `10.0.0.32:80`. HTTPS waits until there is a domain name.
 
 ## This machine
 
@@ -72,9 +74,9 @@ Memory limits: Neo4j heap 512 MB, page cache 256 MB, container limit 1536 MB. AP
 
 ## The site
 
-React, Vite, React Router. Three pages: House, Activities, Booking. A booking stores a name, a date, and a short note in Neo4j. No accounts and no payment.
+React, Vite, React Router. Home, four house pages (boven, beneden, inkom, tuin), and booking. Nearby activities are a section on the home page. A booking stores a name, a date, and a short note in Neo4j. No accounts and no payment.
 
-UI strings: `web/src/i18n/en.js`. Dutch later is a second file beside it.
+UI strings: `web/src/i18n/nl.js` is what the site shows. `en.js` is still in the folder.
 
 Graph:
 
@@ -83,7 +85,7 @@ Graph:
 - `(:House)-[:OFFERS]->(:Day)`
 - `(:Booking)-[:ON]->(:Day)` and `(:Booking)-[:AT]->(:House)`
 
-Pictures are sample stand-ins in `content/photos/`.
+Pictures on the site are the files in `content/photos/saraPhotos/housPhotos`. `demoWebPhotos` is only the look reference and is not published. The Neo4j seed still has the earlier sample house text and four sample photos.
 
 ## Internet, after the LAN site works
 
@@ -232,7 +234,7 @@ Private repo `git@github.com:samcasters/saraWebsite.git`. Push comes after the s
 - [x] Photo folder is mounted into the web Pod
 - [x] Ingress routes `/` and `/api`
 - [x] Site opened from the LAN at `http://10.0.0.32/`
-- [x] English copy is read from `web/src/i18n/en.js`
+- [x] UI strings are read from `web/src/i18n` (live language is `nl.js`)
 
 ### Internet
 
@@ -253,9 +255,9 @@ Private repo `git@github.com:samcasters/saraWebsite.git`. Push comes after the s
 
 ## Decisions
 
-- Sample content. Display name "Sara's house".
+- Site name Vakantiehuis La Carrière, from the design pictures. The Neo4j sample record is still "Sara's house".
 - Booking saves a name, a date, and a short note.
-- English UI, with the strings in one module.
+- Dutch UI in `nl.js`. `en.js` remains for a later switch.
 - Private GitHub repo.
 - One replica of each app.
 - LAN first, then port 80 on the router. HTTP until there is a domain.
@@ -280,3 +282,4 @@ A second node, a domain name, HTTPS, accounts, email, and payments.
 - 2026-10-19: Public address is `91.183.41.76`. The public URL will be `http://91.183.41.76/` after the router forwards TCP 80 to `10.0.0.32:80`. Do not forward 7474 or 7687. HTTPS stays off until there is a domain name. Neo4j data path is the PVC folder above. MicroK8s version v1.36.2. LAN URL `http://10.0.0.32/`.
 - 2026-10-19: Practice Pods and Service removed. Namespace `sara` now has `neo4j-0`, the API Deployment, and the web Deployment.
 - 2026-10-19: Private repo https://github.com/samcasters/saraWebsite has `main` at `11d3173`. Password and test guest names are not in the repo.
+- 2026-10-19: Frontend rebuilt from the design pictures. From this Pi, `http://10.0.0.32/` returned title Vakantiehuis La Carrière, `/huis/boven`, `/booking`, and `/api/health` returned 200, and `/photos/saraPhotos/housPhotos/outsideHouse1.jpg` returned the picture. There is no browser on the Pi, so the calendar was not clicked.
