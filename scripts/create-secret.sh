@@ -22,7 +22,8 @@ if "$K8S" kubectl get secret -n sara sara-secret >/dev/null 2>&1; then
   exit 0
 fi
 
-pass=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)
+# hex avoids a SIGPIPE from `head` under `set -o pipefail`.
+pass=$(openssl rand -hex 10)
 "$K8S" kubectl create secret generic sara-secret -n sara \
   --from-literal=NEO4J_PASSWORD="$pass" \
   --from-literal=NEO4J_AUTH="neo4j/${pass}"
